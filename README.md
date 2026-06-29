@@ -1,6 +1,6 @@
 # Autonomous SAR Ops Core
 
-Autonomous SAR Ops Core is a Python-based multi-drone search-and-rescue autonomy project. It combines Gymnasium-style environment design, A* path planning, greedy and MILP-based task allocation, disruption-aware replanning, and experiment-based evaluation.
+Autonomous SAR Ops Core is a Python-based multi-agent search-and-rescue autonomy project. It combines Gymnasium-style environment design, A* path planning, greedy and MILP-based task allocation, disruption-aware replanning, and experiment-based evaluation.
 
 The Unity visualisation layer is maintained separately so the Python autonomy logic and Unity scene/assets can be versioned independently.
 
@@ -8,7 +8,7 @@ The Unity visualisation layer is maintained separately so the Python autonomy lo
 
 ## Project Goal
 
-The goal of this project is to build a small but extensible autonomy system where multiple drones search a hazardous area, visit priority zones, avoid obstacles, manage battery constraints, and adapt when the mission environment changes.
+The goal of this project is to build a small but extensible autonomy system where multiple agents search a hazardous area, visit priority zones, avoid obstacles, manage battery constraints, and adapt when the mission environment changes.
 
 This repository focuses on the core autonomy logic:
 
@@ -25,13 +25,13 @@ Unity is used as an external visualisation client rather than the main source of
 
 ## Problem
 
-Autonomous drones must search a grid-based environment while handling:
+Autonomous agents must search a grid-based environment while handling:
 
 * obstacles and blocked paths
 * search/rescue targets
 * priority inspection zones
 * limited battery
-* multiple drones
+* multiple agents
 * dynamic disruptions
 * route replanning
 
@@ -54,7 +54,7 @@ Python Core Repo
         │ exports mission state / replay data as JSON
         ▼
 Unity Visualisation Repo
-└── Loads mission replay and visualises drones, routes, targets, obstacles, and replanning events
+└── Loads mission replay and visualises agents, routes, targets, obstacles, and replanning events
 ```
 
 *For v0.1, Python owns the decision-making logic. Unity is used mainly to visualise mission execution.*
@@ -67,7 +67,7 @@ Unity Visualisation Repo
 
 A Gymnasium-style SAR grid environment containing:
 
-* drone positions
+* agent positions
 * obstacles
 * targets
 * priority zones
@@ -77,7 +77,7 @@ A Gymnasium-style SAR grid environment containing:
 
 ### Path Planning
 
-A* path planning for drone movement through the grid while avoiding blocked or restricted cells.
+A* path planning for agent movement through the grid while avoiding blocked or restricted cells.
 
 ### Task Allocation
 
@@ -92,7 +92,7 @@ The replanning module updates mission plans when:
 
 * a path becomes blocked
 * a new target appears
-* a drone has insufficient battery
+* a agent has insufficient battery
 * an assigned route becomes invalid
 
 ### Unity Visualisation
@@ -167,7 +167,7 @@ autonomous-sar-ops-core/
 │       │       └── replanner.py
 │       │
 │       ├── mission/
-│       │   ├── drone.py
+│       │   ├── agent.py
 │       │   ├── mission_state.py
 │       │   ├── mission_controller.py
 │       │   └── metrics.py
@@ -185,7 +185,7 @@ autonomous-sar-ops-core/
 ├── scenarios/
 │   ├── small_map.yaml
 │   ├── blocked_path.yaml
-│   └── multi_drone.yaml
+│   └── multi_agent.yaml
 │
 ├── experiments/
 │   ├── run_baseline.py
@@ -251,7 +251,7 @@ autonomous-sar-ops-unity
 
 The Python core exports mission replay files in JSON format. The Unity project reads these replay files and visualises:
 
-* drone movement
+* agent movement
 * assigned routes
 * obstacles
 * blocked paths

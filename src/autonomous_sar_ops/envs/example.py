@@ -4,165 +4,148 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from heapq import heappop, heappush
 from math import sqrt
-from typing import Any, Literal
+from enum import Enum, StrEnum, auto
+from typing import Any, ClassVar, Literal
 
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
 
-AgentType = Literal["ugv", "uav"]
+class AgentType(StrEnum):
+    """
+    An agent can be either ugv (ground robot) or uav (drone).
 
+    ugv = ground robot
+        - ignores no-fly zones
+        - blocked by ground obstacles
+        - uses Manhattan/grid-style movement cost
+        - movement cost = 1.0 per step
+
+    uav = aerial drone
+        - ignores ground obstacles
+        - blocked by no-fly zones
+        - uses Euclidean-style travel cost for planning    
+        - movement cost = 1.0 (if cardinal) | sqrt(2) (if diagonal)
+    """
+    UGV = auto()
+    UAV = auto()
+
+class AgentMode(StrEnum):
+    """
+    Decide what type(s) of agents will be included in the env.
+    """
+    UGV = auto() # all ugv
+    UAV = auto() # all uav
+    BOTH = auto() # mix ugv + uav
+
+class SpawnMode(StrEnum):
+    """
+    Decide what spawning type(s) will be in the env.
+    """
+    SINGLE_BASE = auto() # one base spawn all
+    RANDOM_DEPLOYED = auto() # multiple bases
+
+class Reward(Enum):
+    TARGET_COMPLETED = ("target_completed", 20.00) # reward for finding a target
+    ALL_TARGETS_COMPLETED = ("all_targets_completed", 50.00) # reward for finding all targets
+    TRAVEL_COST = ("travel_cost", -0.20) # penalty for long travel route
+    BATTERY_USAGE = ("battery_usage", -0.05) # penalty for more battery used (i.e. take longer time)
+    ROUTE_BLOCKED = ("route_blocked", -10.00) # penalty for planning route with blockage(s)
+    BATTERY_DEPLETED = ("battery_depleted", -5.00) # penalty for running out of battery mid way
+    IDLE = ("idle", -0.02) # penalty for not progressing
+    TIMEOUT = ("timeout", -25.00) # penalty for running out of time (out of steps but havent found all targets yet)
+
+    def __init__(self, label: str, weight: float) -> None:
+        self.label = label
+        self.weight = weight
 
 @dataclass
 class AgentState:
     id: int
     agent_type: AgentType
     position: tuple[int, int]
+    base_position: tuple[int, int]
     battery: float
     active: bool = True
 
+    assigned_targets: list[int] = field(default_factory=list)
+    route: list[tuple[int, int]] = field(default_factory=list)
+    route_index: int = 0
 
-@dataclass
-class RoutePlan:
-    agent_id: int
-    agent_type: AgentType
-    assigned_targets: list[int]
-    completed_targets: list[int]
-    route: list[tuple[int, int]]
-    route_cost: float
-    battery_used: float
-    valid: bool
-    failure_reason: str | None = None
-
-
-class SARGridMissionEnv(gym.Env):
+class SARGridExecutionEnv(gym.Env):
     """
-    Mission-level multi-agent SAR environment.
-
-    This environment focuses on agent distribution / task allocation.
-
-    Action:
-        action[target_id] = assigned_agent_id
-
-        Example with 3 agents and 4 targets:
-            action = [0, 2, 1, 3]
-
-        Meaning:
-            target 0 -> agent 0
-            target 1 -> agent 2
-            target 2 -> agent 1
-            target 3 -> unassigned
-
-        num_agents is used as the "unassigned" token.
-
-    Agent types:
-        ugv:
-            - ground robot
-            - blocked by obstacle_grid
-            - 4-neighbour movement
-            - Manhattan-style route cost
-
-        uav:
-            - aerial drone
-            - blocked by no_fly_grid
-            - 8-neighbour movement
-            - Euclidean-style route cost
-
-    This is intentionally not a PettingZoo env yet because the current goal is
-    centralised mission planning and allocation, not independent agent policies.
+    Route-following multi-agent SAR execution environment.
+        
+    Flow:
+    
+        Env -> states need planning -> route planning (from planner) -> simulate on gym -> replan if not all requirements met.
+    
     """
 
     metadata = {"render_modes": ["ansi"], "render_fps": 4}
 
-    AGENT_TYPE_TO_ID = {
-        "ugv": 0,
-        "uav": 1,
-    }
-
-    ID_TO_AGENT_TYPE = {
-        0: "ugv",
-        1: "uav",
-    }
-
-    REWARDS = {
-        "target_completed": 20.0,
-        "all_targets_completed": 50.0,
-        "travel_cost": -0.20,
-        "mission_time": -0.10,
-        "battery_usage": -0.05,
-        "invalid_assignment": -15.0,
-        "unassigned_target": -10.0,
-        "inactive_agent_assignment": -10.0,
-        "timeout": -25.0,
-    }
-
     def __init__(
         self,
-        grid_size: tuple[int, int] = (10, 10),
-        agent_types: list[AgentType] | None = None,
-        num_targets: int = 3,
-        max_battery: float = 50.0,
-        max_steps: int = 10,
-        obstacle_ratio: float = 0.15,
-        no_fly_ratio: float = 0.05,
-        base_position: tuple[int, int] = (0, 0),
-        max_reset_tries: int = 200,
+        grid_size: tuple[int, int] = (10, 10), # size of env
+        agent_mode: AgentMode = AgentMode.BOTH, # ground only | drone only | mixed
+        num_ugv: int = 2, # number of ugv
+        num_uav: int = 2, # number of uav
+        num_targets: int = 3, # number of targets in env
+        max_battery: float = 100.0, # max battery of agent
+        max_steps: int = 100, # max step agent(s) can take
+        obstacle_ratio: float = 0.15, # ratios of ground obs (for ugv)
+        no_fly_ratio: float = 0.05, # ratios of no fly zone (for uav)
+        base_position: tuple[int, int] = (0, 0), # postion of the starting base for agents
+        spawn_mode: SpawnMode = SpawnMode.SINGLE_BASE,
+        max_reset_tries: int = 200, # limit for resetting map 
         render_mode: str | None = None,
     ) -> None:
         super().__init__()
 
-        if agent_types is None:
-            agent_types = ["ugv", "ugv"]
-
-        self._validate_agent_types(agent_types)
-
-        if num_targets <= 0:
-            raise ValueError("num_targets must be greater than 0.")
-
-        if grid_size[0] <= 1 or grid_size[1] <= 1:
-            raise ValueError("grid_size must be at least (2, 2).")
-
-        if max_battery <= 0:
-            raise ValueError("max_battery must be greater than 0.")
-
-        if max_steps <= 0:
-            raise ValueError("max_steps must be greater than 0.")
-
-        if not (0.0 <= obstacle_ratio < 1.0):
-            raise ValueError("obstacle_ratio must be in [0.0, 1.0).")
-
-        if not (0.0 <= no_fly_ratio < 1.0):
-            raise ValueError("no_fly_ratio must be in [0.0, 1.0).")
-
+        self._validate_init_args(
+            grid_size=grid_size,
+            num_targets=num_targets,
+            max_battery=max_battery,
+            max_steps=max_steps,
+            obstacle_ratio=obstacle_ratio,
+            no_fly_ratio=no_fly_ratio,
+            spawn_mode=spawn_mode,
+                )
+        
         self.grid_height, self.grid_width = grid_size
-        self.agent_types = list(agent_types)
-        self.num_agents = len(self.agent_types)
+        self.agent_mode = agent_mode
+        self.num_ugv = num_ugv
+        self.num_uav = num_uav
         self.num_targets = num_targets
         self.max_battery = float(max_battery)
         self.max_steps = max_steps
         self.obstacle_ratio = obstacle_ratio
         self.no_fly_ratio = no_fly_ratio
         self.base_position = base_position
+        self.spawn_mode = spawn_mode
         self.max_reset_tries = max_reset_tries
-        self.render_mode = render_mode
+        self.render_mode = render_mode       
+
+        self.agent_types = self._build_agent_types(
+            agent_mode=self.agent_mode,
+            num_ugv=self.num_ugv,
+            num_uav=self.num_uav,
+        )
+
+        self.num_agents = len(self.agent_types)
+        
 
         if not self._in_bounds(self.base_position):
             raise ValueError("base_position must be inside the grid.")
 
-        # Action format:
-        # one assignment decision per target.
-        #
-        # Values:
-        # 0 ... num_agents - 1 = assigned agent id
-        # num_agents          = unassigned
-        self.unassigned_action = self.num_agents
-        self.action_space = spaces.MultiDiscrete(
-            [self.num_agents + 1] * self.num_targets
-        )
+        # Option B:
+        # The env has no allocation/movement action.
+        # action=0 means "advance simulation by one tick using current routes".
+        self.action_space = spaces.Discrete(1)
 
         max_coord = max(self.grid_height - 1, self.grid_width - 1)
 
@@ -262,8 +245,7 @@ class SARGridMissionEnv(gym.Env):
             reachable_cells = self._get_reachable_cells_for_team()
 
             candidate_targets = sorted(
-                cell
-                for cell in reachable_cells
+                cell for cell in reachable_cells
                 if cell != self.base_position
             )
 
@@ -295,134 +277,184 @@ class SARGridMissionEnv(gym.Env):
 
         self.target_completed = np.zeros(self.num_targets, dtype=np.int8)
 
-        self.agents = [
-            AgentState(
-                id=agent_id,
+        self.agents = []
+        occupied_starts: set[tuple[int, int]] = set()
+
+        for agent_id, agent_type in enumerate(self.agent_types):
+            start_position = self._sample_agent_start_position(
                 agent_type=agent_type,
-                position=self.base_position,
-                battery=self.max_battery,
-                active=True,
+                occupied_starts=occupied_starts,
             )
-            for agent_id, agent_type in enumerate(self.agent_types)
-        ]
+            occupied_starts.add(start_position)
+
+            self.agents.append(
+                AgentState(
+                    id=agent_id,
+                    agent_type=agent_type,
+                    position=start_position,
+                    base_position=self.base_position,
+                    battery=self.max_battery,
+                    active=True,
+                )
+            )
 
         self.visited = np.zeros(
             (self.grid_height, self.grid_width),
             dtype=np.int32,
         )
-        base_row, base_col = self.base_position
-        self.visited[base_row, base_col] = self.num_agents
+
+        for agent in self.agents:
+            row, col = agent.position
+            self.visited[row, col] += 1
 
         return self._get_obs(), self._get_info()
 
     def step(
         self,
-        action: np.ndarray | list[int],
+        action: int = 0,
     ) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
-        assignments = np.asarray(action, dtype=np.int64)
-
-        if assignments.shape != (self.num_targets,):
-            raise ValueError(
-                f"Expected action shape {(self.num_targets,)}, got {assignments.shape}."
-            )
-
-        if np.any(assignments < 0) or np.any(assignments > self.num_agents):
-            raise ValueError(
-                f"Assignments must be in [0, {self.num_agents}], where "
-                f"{self.num_agents} means unassigned."
-            )
+        if int(action) != 0:
+            raise ValueError("SARGridExecutionEnv only supports action=0.")
 
         self.step_count += 1
 
         reward_parts = {key: 0.0 for key in self.REWARDS}
+        events: list[dict[str, Any]] = []
 
-        targets_by_agent = self._group_targets_by_agent(assignments)
-
-        route_plans: list[RoutePlan] = []
+        replan_required = False
         completed_this_step = 0
         total_travel_cost = 0.0
         total_battery_used = 0.0
-        mission_time = 0.0
+        active_agents_with_routes = 0
 
-        # Penalise unassigned incomplete targets.
-        for target_id, assigned_agent_id in enumerate(assignments):
-            if self.target_completed[target_id]:
-                continue
-
-            if assigned_agent_id == self.unassigned_action:
-                priority = float(self.target_priorities[target_id])
-                reward_parts["unassigned_target"] += (
-                    self.REWARDS["unassigned_target"] * priority
-                )
-
-        # Compute and execute each agent plan.
-        for agent_id, target_ids in targets_by_agent.items():
-            agent = self.agents[agent_id]
-
-            if not target_ids:
-                continue
-
+        for agent in self.agents:
             if not agent.active:
-                reward_parts["inactive_agent_assignment"] += (
-                    self.REWARDS["inactive_agent_assignment"] * len(target_ids)
-                )
-                route_plans.append(
-                    RoutePlan(
-                        agent_id=agent.id,
-                        agent_type=agent.agent_type,
-                        assigned_targets=target_ids,
-                        completed_targets=[],
-                        route=[],
-                        route_cost=0.0,
-                        battery_used=0.0,
-                        valid=False,
-                        failure_reason="assigned_to_inactive_agent",
-                    )
+                continue
+
+            if agent.battery <= 0:
+                agent.active = False
+                replan_required = True
+                reward_parts["battery_depleted"] += self.REWARDS["battery_depleted"]
+                events.append(
+                    {
+                        "type": "battery_depleted",
+                        "agent_id": agent.id,
+                    }
                 )
                 continue
 
-            plan = self._build_nearest_target_route(agent, target_ids)
-            route_plans.append(plan)
+            if not agent.route or agent.route_index >= len(agent.route) - 1:
+                reward_parts["idle"] += self.REWARDS["idle"]
+                continue
 
-            total_travel_cost += plan.route_cost
-            total_battery_used += plan.battery_used
-            mission_time = max(mission_time, plan.route_cost)
+            active_agents_with_routes += 1
 
-            if not plan.valid:
-                reward_parts["invalid_assignment"] += (
-                    self.REWARDS["invalid_assignment"] * max(1, len(target_ids))
+            current_cell = agent.position
+            next_cell = agent.route[agent.route_index + 1]
+
+            if not self._is_valid_cell_for_agent(next_cell, agent.agent_type):
+                agent.route = []
+                agent.route_index = 0
+                agent.assigned_targets = []
+
+                replan_required = True
+                reward_parts["route_blocked"] += self.REWARDS["route_blocked"]
+                events.append(
+                    {
+                        "type": "route_blocked",
+                        "agent_id": agent.id,
+                        "blocked_cell": next_cell,
+                    }
                 )
+                continue
 
-            for completed_target_id in plan.completed_targets:
-                if self.target_completed[completed_target_id]:
+            movement_cost = self._movement_cost(
+                start=current_cell,
+                end=next_cell,
+                agent_type=agent.agent_type,
+            )
+
+            if movement_cost > agent.battery:
+                agent.active = False
+                replan_required = True
+
+                reward_parts["battery_depleted"] += self.REWARDS["battery_depleted"]
+                events.append(
+                    {
+                        "type": "insufficient_battery",
+                        "agent_id": agent.id,
+                        "required": movement_cost,
+                        "remaining": agent.battery,
+                    }
+                )
+                continue
+
+            agent.position = next_cell
+            agent.route_index += 1
+            agent.battery -= movement_cost
+
+            total_travel_cost += movement_cost
+            total_battery_used += movement_cost
+
+            row, col = next_cell
+            self.visited[row, col] += 1
+
+            reward_parts["travel_cost"] += self.REWARDS["travel_cost"] * movement_cost
+            reward_parts["battery_usage"] += (
+                self.REWARDS["battery_usage"] * movement_cost
+            )
+
+            for target_id, target_position in enumerate(self.target_positions):
+                if self.target_completed[target_id]:
                     continue
 
-                self.target_completed[completed_target_id] = 1
-                completed_this_step += 1
+                if agent.position == target_position:
+                    self.target_completed[target_id] = 1
+                    completed_this_step += 1
 
-                priority = float(self.target_priorities[completed_target_id])
-                reward_parts["target_completed"] += (
-                    self.REWARDS["target_completed"] * priority
-                )
+                    priority = float(self.target_priorities[target_id])
+                    reward_parts["target_completed"] += (
+                        self.REWARDS["target_completed"] * priority
+                    )
 
-            if plan.route:
-                agent.position = plan.route[-1]
-
-                for row, col in plan.route:
-                    self.visited[row, col] += 1
-
-            agent.battery -= plan.battery_used
+                    events.append(
+                        {
+                            "type": "target_completed",
+                            "agent_id": agent.id,
+                            "target_id": target_id,
+                            "position": target_position,
+                            "priority": int(priority),
+                        }
+                    )
 
             if agent.battery <= 0:
                 agent.battery = 0.0
                 agent.active = False
-
-        reward_parts["travel_cost"] += self.REWARDS["travel_cost"] * total_travel_cost
-        reward_parts["mission_time"] += self.REWARDS["mission_time"] * mission_time
-        reward_parts["battery_usage"] += self.REWARDS["battery_usage"] * total_battery_used
+                replan_required = True
+                events.append(
+                    {
+                        "type": "battery_depleted",
+                        "agent_id": agent.id,
+                    }
+                )
 
         all_targets_completed = bool(np.all(self.target_completed))
         all_agents_inactive = all(not agent.active for agent in self.agents)
+
+        any_agent_has_route = any(
+            agent.active
+            and agent.route
+            and agent.route_index < len(agent.route) - 1
+            for agent in self.agents
+        )
+
+        if not all_targets_completed and not any_agent_has_route:
+            replan_required = True
+            events.append(
+                {
+                    "type": "all_routes_exhausted_mission_incomplete",
+                }
+            )
 
         terminated = all_targets_completed or all_agents_inactive
         truncated = self.step_count >= self.max_steps
@@ -440,15 +472,151 @@ class SARGridMissionEnv(gym.Env):
         obs = self._get_obs()
         info = self._get_info()
         info["reward_parts"] = reward_parts
-        info["route_plans"] = [self._route_plan_to_dict(plan) for plan in route_plans]
-        info["metrics"] = self._get_metrics(
-            total_travel_cost=total_travel_cost,
-            total_battery_used=total_battery_used,
-            mission_time=mission_time,
-            completed_this_step=completed_this_step,
-        )
+        info["events"] = events
+        info["replan_required"] = replan_required
+        info["metrics"] = {
+            "completed_this_step": completed_this_step,
+            "total_travel_cost": total_travel_cost,
+            "total_battery_used": total_battery_used,
+            "active_agents_with_routes": active_agents_with_routes,
+            "coverage_percentage": self._get_coverage_percentage(),
+        }
 
         return obs, reward, terminated, truncated, info
+
+    def set_agent_routes(
+        self,
+        routes_by_agent: dict[int, dict[str, Any]],
+    ) -> None:
+        """
+        Assign externally planned routes to agents.
+
+        Expected format:
+            {
+                0: {
+                    "target_ids": [0, 2],
+                    "route": [(0, 0), (0, 1), (0, 2), ...],
+                },
+                1: {
+                    "target_ids": [1],
+                    "route": [(3, 4), (3, 5), ...],
+                },
+            }
+        """
+        for agent_id, route_data in routes_by_agent.items():
+            if agent_id < 0 or agent_id >= self.num_agents:
+                raise ValueError(f"Unknown agent id: {agent_id}")
+
+            agent = self.agents[agent_id]
+
+            target_ids = [
+                int(target_id)
+                for target_id in route_data.get("target_ids", [])
+            ]
+            route = [
+                tuple(cell)
+                for cell in route_data.get("route", [])
+            ]
+
+            for target_id in target_ids:
+                if target_id < 0 or target_id >= self.num_targets:
+                    raise ValueError(f"Unknown target id: {target_id}")
+
+            if not route:
+                agent.assigned_targets = []
+                agent.route = []
+                agent.route_index = 0
+                continue
+
+            if route[0] != agent.position:
+                route = [agent.position] + route
+
+            self._validate_route(
+                route=route,
+                agent_type=agent.agent_type,
+                agent_id=agent.id,
+            )
+
+            agent.assigned_targets = target_ids
+            agent.route = route
+            agent.route_index = 0
+
+    def clear_agent_routes(self) -> None:
+        for agent in self.agents:
+            agent.assigned_targets = []
+            agent.route = []
+            agent.route_index = 0
+
+    def get_planning_state(self) -> dict[str, Any]:
+        return {
+            "grid_size": (self.grid_height, self.grid_width),
+            "obstacle_grid": self.obstacle_grid.copy(),
+            "no_fly_grid": self.no_fly_grid.copy(),
+            "base_position": self.base_position,
+            "step_count": self.step_count,
+            "agents": [
+                {
+                    "id": agent.id,
+                    "agent_type": agent.agent_type,
+                    "position": agent.position,
+                    "base_position": agent.base_position,
+                    "battery": agent.battery,
+                    "active": agent.active,
+                    "assigned_targets": list(agent.assigned_targets),
+                }
+                for agent in self.agents
+            ],
+            "targets": [
+                {
+                    "id": target_id,
+                    "position": target_position,
+                    "priority": int(self.target_priorities[target_id]),
+                    "completed": bool(self.target_completed[target_id]),
+                    "reachable_by": self._get_agent_types_that_can_reach_cell(
+                        target_position
+                    ),
+                }
+                for target_id, target_position in enumerate(self.target_positions)
+            ],
+        }
+
+    def block_cell(
+        self,
+        cell: tuple[int, int],
+        layer: Literal["obstacle", "no_fly"] = "obstacle",
+    ) -> None:
+        if not self._in_bounds(cell):
+            raise ValueError(f"Cell {cell} is outside the grid.")
+
+        if cell == self.base_position:
+            raise ValueError("Cannot block the base position.")
+
+        row, col = cell
+
+        if layer == "obstacle":
+            self.obstacle_grid[row, col] = 1
+        elif layer == "no_fly":
+            self.no_fly_grid[row, col] = 1
+        else:
+            raise ValueError("layer must be 'obstacle' or 'no_fly'.")
+
+    def get_route(
+        self,
+        start: tuple[int, int],
+        goal: tuple[int, int],
+        agent_type: AgentType,
+    ) -> list[tuple[int, int]]:
+        _, path = self._shortest_path(start, goal, agent_type)
+        return path
+
+    def get_travel_cost(
+        self,
+        start: tuple[int, int],
+        goal: tuple[int, int],
+        agent_type: AgentType,
+    ) -> float:
+        cost, _ = self._shortest_path(start, goal, agent_type)
+        return cost
 
     def render(self) -> str | None:
         if self.render_mode != "ansi":
@@ -493,153 +661,89 @@ class SARGridMissionEnv(gym.Env):
 
         return output
 
-    def get_travel_cost(
+    def _sample_agent_start_position(
         self,
+        *,
+        agent_type: AgentType,
+        occupied_starts: set[tuple[int, int]],
+    ) -> tuple[int, int]:
+        if self.spawn_mode == "single_base":
+            return self.base_position
+
+        if self.spawn_mode == "random_deployed":
+            reachable_cells = sorted(
+                self._get_reachable_cells_from_base_for_type(agent_type)
+            )
+
+            candidates = [
+                cell for cell in reachable_cells
+                if cell not in occupied_starts
+                and cell not in self.target_positions
+            ]
+
+            if not candidates:
+                return self.base_position
+
+            selected_idx = int(self.np_random.integers(0, len(candidates)))
+            return candidates[selected_idx]
+
+        raise ValueError(f"Unknown spawn_mode: {self.spawn_mode}")
+
+    def _validate_route(
+        self,
+        *,
+        route: list[tuple[int, int]],
+        agent_type: AgentType,
+        agent_id: int,
+    ) -> None:
+        for cell in route:
+            if not self._is_valid_cell_for_agent(cell, agent_type):
+                raise ValueError(
+                    f"Invalid route for agent {agent_id}. "
+                    f"Cell {cell} is blocked for {agent_type}."
+                )
+
+        for current_cell, next_cell in zip(route[:-1], route[1:], strict=True):
+            self._movement_cost(
+                start=current_cell,
+                end=next_cell,
+                agent_type=agent_type,
+            )
+
+    def _movement_cost(
+        self,
+        *,
         start: tuple[int, int],
-        goal: tuple[int, int],
+        end: tuple[int, int],
         agent_type: AgentType,
     ) -> float:
-        """
-        Public helper for greedy/MILP planners.
+        start_row, start_col = start
+        end_row, end_col = end
 
-        Returns inf if no feasible path exists for the given agent type.
-        """
-        cost, _ = self._shortest_path(start, goal, agent_type)
-        return cost
+        d_row = abs(end_row - start_row)
+        d_col = abs(end_col - start_col)
 
-    def get_route(
-        self,
-        start: tuple[int, int],
-        goal: tuple[int, int],
-        agent_type: AgentType,
-    ) -> list[tuple[int, int]]:
-        """
-        Public helper for Unity replay / planner debugging.
-        """
-        _, path = self._shortest_path(start, goal, agent_type)
-        return path
-
-    def get_blocked_cells_for_agent_type(
-        self,
-        agent_type: AgentType,
-    ) -> set[tuple[int, int]]:
         if agent_type == "ugv":
-            grid = self.obstacle_grid
-        elif agent_type == "uav":
-            grid = self.no_fly_grid
-        else:
-            raise ValueError(f"Unknown agent_type: {agent_type}")
+            if d_row + d_col != 1:
+                raise ValueError(
+                    f"Invalid UGV move from {start} to {end}. "
+                    "UGV can only move one cardinal cell."
+                )
+            return 1.0
 
-        rows, cols = np.where(grid == 1)
-
-        return {
-            (int(row), int(col))
-            for row, col in zip(rows, cols, strict=True)
-        }
-
-    def _group_targets_by_agent(
-        self,
-        assignments: np.ndarray,
-    ) -> dict[int, list[int]]:
-        targets_by_agent = {
-            agent_id: []
-            for agent_id in range(self.num_agents)
-        }
-
-        for target_id, assigned_agent_id in enumerate(assignments):
-            if self.target_completed[target_id]:
-                continue
-
-            if assigned_agent_id == self.unassigned_action:
-                continue
-
-            targets_by_agent[int(assigned_agent_id)].append(target_id)
-
-        return targets_by_agent
-
-    def _build_nearest_target_route(
-        self,
-        agent: AgentState,
-        target_ids: list[int],
-    ) -> RoutePlan:
-        """
-        Build a simple nearest-neighbour route for all targets assigned to one agent.
-
-        This intentionally keeps route sequencing simple for v0.1.
-        MILP/OR-Tools can replace this later.
-        """
-        current_position = agent.position
-        remaining_targets = list(target_ids)
-
-        route: list[tuple[int, int]] = [current_position]
-        completed_targets: list[int] = []
-        total_cost = 0.0
-        battery_used = 0.0
-
-        while remaining_targets:
-            best_target_id: int | None = None
-            best_cost = float("inf")
-            best_path: list[tuple[int, int]] = []
-
-            for target_id in remaining_targets:
-                target_position = self.target_positions[target_id]
-                cost, path = self._shortest_path(
-                    current_position,
-                    target_position,
-                    agent.agent_type,
+        if agent_type == "uav":
+            if max(d_row, d_col) != 1:
+                raise ValueError(
+                    f"Invalid UAV move from {start} to {end}. "
+                    "UAV can only move to one neighbouring cell per tick."
                 )
 
-                if cost < best_cost:
-                    best_target_id = target_id
-                    best_cost = cost
-                    best_path = path
+            if d_row == 1 and d_col == 1:
+                return sqrt(2)
 
-            if best_target_id is None or not np.isfinite(best_cost) or not best_path:
-                return RoutePlan(
-                    agent_id=agent.id,
-                    agent_type=agent.agent_type,
-                    assigned_targets=target_ids,
-                    completed_targets=completed_targets,
-                    route=route,
-                    route_cost=total_cost,
-                    battery_used=battery_used,
-                    valid=False,
-                    failure_reason="unreachable_target",
-                )
+            return 1.0
 
-            if battery_used + best_cost > agent.battery:
-                return RoutePlan(
-                    agent_id=agent.id,
-                    agent_type=agent.agent_type,
-                    assigned_targets=target_ids,
-                    completed_targets=completed_targets,
-                    route=route,
-                    route_cost=total_cost,
-                    battery_used=battery_used,
-                    valid=False,
-                    failure_reason="insufficient_battery",
-                )
-
-            # Avoid duplicating the current cell when joining paths.
-            route.extend(best_path[1:])
-            total_cost += best_cost
-            battery_used += best_cost
-
-            current_position = self.target_positions[best_target_id]
-            completed_targets.append(best_target_id)
-            remaining_targets.remove(best_target_id)
-
-        return RoutePlan(
-            agent_id=agent.id,
-            agent_type=agent.agent_type,
-            assigned_targets=target_ids,
-            completed_targets=completed_targets,
-            route=route,
-            route_cost=total_cost,
-            battery_used=battery_used,
-            valid=True,
-            failure_reason=None,
-        )
+        raise ValueError(f"Unknown agent_type: {agent_type}")
 
     def _shortest_path(
         self,
@@ -647,19 +751,6 @@ class SARGridMissionEnv(gym.Env):
         goal: tuple[int, int],
         agent_type: AgentType,
     ) -> tuple[float, list[tuple[int, int]]]:
-        """
-        Dijkstra-style shortest path.
-
-        UGV:
-            4-neighbour movement
-            blocked by obstacle_grid
-            cost = 1 per move
-
-        UAV:
-            8-neighbour movement
-            blocked by no_fly_grid
-            cost = 1 for cardinal, sqrt(2) for diagonal
-        """
         if not self._is_valid_cell_for_agent(start, agent_type):
             return float("inf"), []
 
@@ -754,12 +845,6 @@ class SARGridMissionEnv(gym.Env):
         return path
 
     def _apply_reset_options(self, options: dict[str, Any]) -> None:
-        """
-        Allows reset-time difficulty changes that do not alter observation shape.
-
-        Do not change agent_types or num_targets here because Gym spaces are fixed
-        after environment creation.
-        """
         if "obstacle_ratio" in options:
             obstacle_ratio = float(options["obstacle_ratio"])
             if not (0.0 <= obstacle_ratio < 1.0):
@@ -912,6 +997,7 @@ class SARGridMissionEnv(gym.Env):
     def _get_info(self) -> dict[str, Any]:
         return {
             "step_count": self.step_count,
+            "agent_mode": self.agent_mode,
             "agent_types": list(self.agent_types),
             "completed_targets": int(np.sum(self.target_completed)),
             "num_targets": self.num_targets,
@@ -922,8 +1008,12 @@ class SARGridMissionEnv(gym.Env):
                     "id": agent.id,
                     "agent_type": agent.agent_type,
                     "position": agent.position,
+                    "base_position": agent.base_position,
                     "battery": agent.battery,
                     "active": agent.active,
+                    "assigned_targets": list(agent.assigned_targets),
+                    "route_index": agent.route_index,
+                    "route_length": len(agent.route),
                 }
                 for agent in self.agents
             ],
@@ -939,25 +1029,6 @@ class SARGridMissionEnv(gym.Env):
                 }
                 for target_id, target_position in enumerate(self.target_positions)
             ],
-        }
-
-    def _get_metrics(
-        self,
-        *,
-        total_travel_cost: float,
-        total_battery_used: float,
-        mission_time: float,
-        completed_this_step: int,
-    ) -> dict[str, Any]:
-        return {
-            "total_travel_cost": total_travel_cost,
-            "total_battery_used": total_battery_used,
-            "mission_time": mission_time,
-            "completed_this_step": completed_this_step,
-            "completed_targets": int(np.sum(self.target_completed)),
-            "num_targets": self.num_targets,
-            "success_rate": float(np.sum(self.target_completed) / self.num_targets),
-            "coverage_percentage": self._get_coverage_percentage(),
         }
 
     def _get_coverage_percentage(self) -> float:
@@ -989,82 +1060,211 @@ class SARGridMissionEnv(gym.Env):
         return sorted(reachable_by)
 
     @staticmethod
-    def _route_plan_to_dict(plan: RoutePlan) -> dict[str, Any]:
-        return {
-            "agent_id": plan.agent_id,
-            "agent_type": plan.agent_type,
-            "assigned_targets": plan.assigned_targets,
-            "completed_targets": plan.completed_targets,
-            "route": plan.route,
-            "route_cost": plan.route_cost,
-            "battery_used": plan.battery_used,
-            "valid": plan.valid,
-            "failure_reason": plan.failure_reason,
-        }
+    def _build_agent_types(
+        *,
+        agent_mode: AgentMode,
+        num_agents: int,
+        num_ugv: int,
+        num_uav: int,
+    ) -> list[AgentType]:
+        if agent_mode == "ugv":
+            if num_agents <= 0:
+                raise ValueError("num_agents must be greater than 0.")
+            return ["ugv"] * num_ugv
+
+        if agent_mode == "uav":
+            if num_agents <= 0:
+                raise ValueError("num_agents must be greater than 0.")
+            return ["uav"] * num_uav
+
+        if agent_mode == "both":
+            if num_ugv <= 0:
+                raise ValueError("num_ugv must be greater than 0 when agent_mode='both'.")
+
+            if num_uav <= 0:
+                raise ValueError("num_uav must be greater than 0 when agent_mode='both'.")
+
+            return (["ugv"] * num_ugv) + (["uav"] * num_uav)
+
+        raise ValueError("agent_mode must be one of: 'ugv', 'uav', 'both'.")
 
     @staticmethod
-    def _validate_agent_types(agent_types: list[AgentType]) -> None:
-        if len(agent_types) == 0:
-            raise ValueError("agent_types must contain at least one agent.")
+    def _validate_init_args(
+        *,
+        grid_size: tuple[int, int],
+        agent_mode: AgentMode,
+        num_ugv: int,
+        num_uav: int,
+        num_targets: int,
+        max_battery: float,
+        max_steps: int,
+        obstacle_ratio: float,
+        no_fly_ratio: float,
+    )
+        if grid_size[0] <=1 or grid_size[1] <= 1:
+            raise ValueError("grid_size must be at least (2,2).")
+    
+        if agent_mode == AgentMode.UGV and num_ugv <= 0:
+            raise ValueError("In UGV mode: num_ugv must be greater than 0.")
+    
+        if agent_mode == AgentMode.UAV and num_uav <= 0:
+            raise ValueError("In UAV mode: num_uav must be greater than 0.")
 
-        invalid_types = [
-            agent_type
-            for agent_type in agent_types
-            if agent_type not in ("ugv", "uav")
-        ]
+        if agent_mode == AgentMode.BOTH and (num_uav <= 0 or num_ugv <= 0):
+            raise ValueError("In BOTH mode: requires atleast 1 agent for each of the agent types.")
+                    
+        if num_targets <= 0:
+            raise ValueError("num_targets must be greater than 0.")
+    
+        if max_battery <= 0:
+            raise ValueError("max_battery must be greater than 0.")
 
-        if invalid_types:
-            raise ValueError(
-                f"Invalid agent types: {invalid_types}. "
-                "Allowed values are 'ugv' and 'uav'."
+        if max_steps <= 0:
+            raise ValueError("max_steps must be greater than 0.")
+
+        if obstacle_ratio > 1 or obstacle_ratio < 0 :
+            raise ValueError("obstacle_ratio must be in range [0,1] inclusive.")
+
+        if no_fly_ratio > 1 or no_fly_ratio < 0 :
+            raise ValueError("no_fly_ratio must be in range [0,1] inclusive.")
+            
+SARGridEnv = SARGridExecutionEnv
+
+def build_greedy_spread_routes(env: SARGridExecutionEnv) -> dict[int, dict[str, Any]]:
+    """
+    Assign each active agent to a different incomplete target.
+
+    This is a simple baseline planner:
+        - each agent gets at most one target per planning cycle
+        - targets are not duplicated
+        - candidate score = route_cost / target_priority
+        - unreachable or battery-infeasible targets are skipped
+
+    Later, MILP will replace this.
+    """
+    planning_state = env.get_planning_state()
+
+    incomplete_targets = [
+        target
+        for target in planning_state["targets"]
+        if not target["completed"]
+    ]
+
+    active_agents = [
+        agent
+        for agent in planning_state["agents"]
+        if agent["active"]
+    ]
+
+    assigned_targets: set[int] = set()
+    routes_by_agent: dict[int, dict[str, Any]] = {}
+
+    for agent in active_agents:
+        best_target: dict[str, Any] | None = None
+        best_route: list[tuple[int, int]] = []
+        best_score = float("inf")
+        best_cost = float("inf")
+
+        for target in incomplete_targets:
+            target_id = int(target["id"])
+
+            if target_id in assigned_targets:
+                continue
+
+            route = env.get_route(
+                start=agent["position"],
+                goal=target["position"],
+                agent_type=agent["agent_type"],
             )
 
+            if not route:
+                continue
 
-# Backwards-compatible alias if your imports still use SARGridEnv.
-SARGridEnv = SARGridMissionEnv
+            cost = env.get_travel_cost(
+                start=agent["position"],
+                goal=target["position"],
+                agent_type=agent["agent_type"],
+            )
+
+            if not np.isfinite(cost):
+                continue
+
+            if cost > float(agent["battery"]):
+                continue
+
+            priority = float(target["priority"])
+
+            # Lower score is better.
+            # High-priority targets become more attractive.
+            score = cost / priority
+
+            if score < best_score:
+                best_score = score
+                best_cost = cost
+                best_target = target
+                best_route = route
+
+        if best_target is None:
+            continue
+
+        target_id = int(best_target["id"])
+        assigned_targets.add(target_id)
+
+        routes_by_agent[int(agent["id"])] = {
+            "target_ids": [target_id],
+            "route": best_route,
+            "route_cost": best_cost,
+        }
+
+    return routes_by_agent
 
 
 def main() -> None:
-    env = SARGridMissionEnv(
+    env = SARGridExecutionEnv(
         grid_size=(10, 10),
-        agent_types=["ugv", "ugv", "uav"],
+        agent_mode="ugv",
+        num_ugv=4,
+        num_uav=0,
         num_targets=4,
-        max_battery=50.0,
-        max_steps=5,
+        max_battery=100.0,
+        max_steps=1000,
         obstacle_ratio=0.15,
         no_fly_ratio=0.05,
+        spawn_mode="single_base",
         render_mode="ansi",
     )
 
-    obs, info = env.reset(seed=42)
+    obs, info = env.reset(seed=1)
 
-    print("Initial observation keys:")
-    print(obs.keys())
-
-    print("\nInitial info:")
-    print(info)
-
-    print("\nInitial map:")
+    print("Initial map:")
     env.render()
 
-    done = False
+    # Temporary demo route assignment.
+    # Later this should come from greedy_allocator.py or milp_allocator.py.
+    routes_by_agent = build_greedy_spread_routes(env)
+    env.set_agent_routes(routes_by_agent)
+    print("Agents: ", env.agents)
+    print("Number of agents: ", env.num_agents)
+    print("Number of targets: ", env.num_targets)
+    print("Target position: ", env.target_positions)
+    print("Routes: ", routes_by_agent)
 
-    while not done:
-        # Random allocation:
-        # each target assigned to agent 0, 1, 2, or 3 where 3 = unassigned.
-        action = env.action_space.sample()
+    terminated = False
+    truncated = False
 
-        obs, reward, terminated, truncated, info = env.step(action)
+    while not (terminated or truncated):
+        obs, reward, terminated, truncated, info = env.step(0)
 
-        print(f"Action: {action}")
         print(f"Reward: {reward}")
-        print(f"Reward parts: {info['reward_parts']}")
-        print(f"Metrics: {info['metrics']}")
+        print(f"Events: {info['events']}")
+        print(f"Replan required: {info['replan_required']}")
         print(f"Completed targets: {info['completed_targets']}/{info['num_targets']}")
 
         env.render()
 
-        done = terminated or truncated
+        if info["replan_required"] and not terminated and not truncated:
+            print("Replanning would be triggered here.")
+            break
 
 
 if __name__ == "__main__":

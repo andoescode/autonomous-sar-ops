@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from math import sqrt
 from typing import Any, Literal
 
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
-AgentType = Literal["ugv", "uav"]
+AgentType = Literal["ugv", "uav"] # an agent can be either ugv (ground robot) or uav (drone)
+AgentMode = Literal["ugv", "uav", "both"] # env includes: all ugv | all uav | both ugv and uav
+SpawnMode = Literal["single_base", "random_deployed"] # extension: allows multiple base started
 
 # Agent types:
 #         ugv = ground robot
@@ -27,53 +30,61 @@ class AgentState:
     """
     State of each agent in env {A_i: (position, battery, active_state)}
     """
+    # Features
     id: int
+    agent_type: AgentType # agent type
     position: tuple[int, int] # agent position
-    battery: int # agent battery level
+    base_position: tuple[int, int] # base position
+    battery: float # agent battery level
     active: bool = True # agent active state
 
-class SARGridEnv(gym.Env):
-    """
-    Multi-agent search-and-rescue grid environment.
+    # Assignment
+    assigned_targets: list[int] = field(default_factory=list)
+    route: list[tuple[int, int]] = field(default_factory=list)
+    route_index: int = 0
 
-    Actions per agent:
-        0 = stay
-        1 = up
-        2 = down
-        3 = left
-        4 = right
+class SARGridAllocatingEnv(gym.Env):
+    """
+    Route-following multi-agent SAR execution environment.
+    
+    Flow:
+
+        Env -> states need planning -> route planning (from planner) -> simulate on gym -> replan if not all requirements met.
+
     """
 
     metadata = {"render_modes": ["ansi"], "render_fps": 4}
 
-    ACTIONS = {
-            "stay": 0,
-            "up": 1,
-            "down": 2,
-            "left": 3,
-            "right": 4,
+    AGENT_TYPE_TO_ID = {
+            "ugv": 0,
+            "uav": 1,
         }
 
-    ID_TO_ACTION = {v: k for k, v in ACTIONS.items()}
-
     REWARDS = {
-        "step": -0.05, # the less step taken the better
-        "new_cell": 0.10, # discover new cell
-        "invalid_move": -1.00, # move out of grid or bump into obstacle(s)
-        "target_completed": 10.00, # find a target
-        "all_targets_completed": 20.00, # find all targets
-        "battery_depleted": -5.00, # ran out of battery mid way
-        "timeout": -10.00, # ran out of time (out of steps but havent found all targets yet)
+        "target_completed": 20.00, # reward for finding a target
+        "all_targets_completed": 50.00, # reward for finding all targets
+        "travel_cost": -0.20, # penalty for long travel route
+        "battery_usage": -0.05, # penalty for more battery used (i.e. take longer time)
+        "route_blocked": -10.0, # penalty for planning route with blockage(s)
+        "battery_depleted": -5.00, # penalty for running out of battery mid way
+        "idle": -0.02, # penalty for not progressing
+        "timeout": -25.00, # penalty for running out of time (out of steps but havent found all targets yet)
     }
     
     def __init__(
         self,
         grid_size: tuple[int, int] = (10, 10), # size of env
-        # num_agents: int = 2, # number of agents in env
-        agent_types: list[AgentType] | None = None, # land or aerial agent(s) or both
+        agent_mode: AgentMode = "both", # ground only | drone only | mixed
+        num_ugv: int = 2, # number of ugv
+        num_uav: int = 2, # number of uav
         num_targets: int = 3, # number of targets in env
-        max_battery: int = 50, # max battery of agent
+        max_battery: float = 100.0, # max battery of agent
         max_steps: int = 100, # max step agent(s) can take
+        obstacle_ratio: float = 0.15, # ratios of ground obs (for ugv)
+        no_fly_ratio: float = 0.05, # ratios of no fly zone (for uav)
+        base_position: tuple[int, int] = (0, 0), # postion of the starting base for agents
+        spawn_mode: SpawnMode = "single_base",
+        max_reset_tries: int = 200, # limit for resetting map 
         render_mode: str | None = None,
     ) -> None:
         super().__init__()
@@ -91,7 +102,6 @@ class SARGridEnv(gym.Env):
         self.num_agents = len(agent_types)
 
         self.grid_height, self.grid_width = grid_size
-        self.num_agents = num_agents
         self.num_targets = num_targets
         self.max_battery = max_battery
         self.max_steps = max_steps
@@ -139,11 +149,40 @@ class SARGridEnv(gym.Env):
         )
 
         self.grid: np.ndarray # grid array representation
-        self.agents: list[DroneState] # list of agents (states)
+        self.agents: list[AgentState] # list of agents (states)
         self.target_positions: list[tuple[int, int]] # list of target positions
         self.target_completed: np.ndarray # Array 
         self.step_count: int # keep track of the step taken
 
+    @staticmethod
+    def _validate_init_args(
+        *,
+        grid_size: tuple[int, int],
+        agent_mode: AgentMode,
+        num_ugv: int,
+        num_uav: int,
+        num_targets: int,
+        max_battery: float,
+        max_steps: int,
+        obstacle_ratio: float,
+        no_fly_ratio: float,
+        spawn_mode: SpawnMode,
+    )
+        if grid_size[0] <=1 or grid_size[1] <= 1:
+            raise ValueError("grid_size must be at least (2,2).")
+
+        if agent_mode == num_ugv <= 0:
+            raise ValueError("num_targets must be greater than 0.")
+
+        if num_uav <= 0:
+            raise ValueError("num_targets must be greater than 0.")
+        
+        if num_targets <= 0:
+            raise ValueError("num_targets must be greater than 0.")
+
+        if max_battery <= 0:
+            raise ValueError("max_battery must be greater than 0.")
+        
     def reset(
             self,
             seed: int | None = None,

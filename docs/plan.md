@@ -5,7 +5,7 @@
 Build a small autonomous search-and-rescue simulation project that demonstrates:
 
 * Gym-style environment design
-* multi-drone mission logic
+* multi-agent mission logic
 * A* path planning
 * greedy vs MILP task allocation
 * disruption-aware replanning
@@ -28,12 +28,12 @@ The Python core exports mission state and replay data as JSON. Unity reads the r
 ```text
 Python env + planner + controller
         ↓
-sends drone states, routes, targets, and events
+sends agent states, routes, targets, and events
         ↓
 Unity visualisation
 ```
 
-*For v0.1, Python owns the decision logic. Unity is mainly used to visualise drone movement, routes, obstacles, targets, and mission events.*
+*For v0.1, Python owns the decision logic. Unity is mainly used to visualise agent movement, routes, obstacles, targets, and mission events.*
 
 ---
 
@@ -42,7 +42,7 @@ Unity visualisation
 Implement:
 
 * 2D grid SAR environment
-* 2–3 drones
+* 2–3 agents
 * obstacles and blocked paths
 * search/rescue targets
 * priority zones
@@ -141,8 +141,8 @@ autonomous-sar-ops-core/
 
 Final v0.1 bullet:
 
-> Built an autonomous multi-drone search-and-rescue simulation system integrating a Gym-style environment, A* path planning, MILP-based task allocation, disruption-aware replanning, and Unity-based mission visualisation.
+> Built an autonomous multi-agent search-and-rescue simulation system integrating a Gym-style environment, A* path planning, MILP-based task allocation, disruption-aware replanning, and Unity-based mission visualisation.
 
 Stronger version after experiments:
 
-> Developed an autonomous SAR simulation platform comparing greedy and MILP-based planners across blocked-path and multi-drone scenarios using mission completion time, route distance, coverage, and rescue success metrics.
+> Developed an autonomous SAR simulation platform comparing greedy and MILP-based planners across blocked-path and multi-agent scenarios using mission completion time, route distance, coverage, and rescue success metrics.
